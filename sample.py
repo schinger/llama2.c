@@ -76,4 +76,7 @@ with torch.no_grad():
         for k in range(num_samples):
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
             print(enc.decode(y[0].tolist()))
+            # break_idx = y[0].tolist()[1:].index(enc.bos_id) + 1
+            # # print(y[0].tolist(), break_idx)
+            # print(enc.decode(y[0].tolist()[:break_idx]))
             print('---------------')
