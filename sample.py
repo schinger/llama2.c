@@ -3,6 +3,7 @@ Sample from the trained model with PyTorch
 """
 import os
 import pickle
+import time
 from contextlib import nullcontext
 import torch
 from model import ModelArgs, Transformer
@@ -37,6 +38,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # init from a model saved in a specific directory
 checkpoint_dict = torch.load(checkpoint, map_location=device)
 gptconf = ModelArgs(**checkpoint_dict['model_args'])
+gptconf.cache = True
 model = Transformer(gptconf)
 state_dict = checkpoint_dict['model']
 unwanted_prefix = '_orig_mod.'
@@ -68,15 +70,16 @@ if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
         start = f.read()
 start_ids = enc.encode(start, bos=True, eos=False)
+# print(f'Prompt length: {len(start_ids)} tokens')
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-
 # run generation
+t0 = time.time()
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(enc.decode(y[0].tolist()))
-            # break_idx = y[0].tolist()[1:].index(enc.bos_id) + 1
-            # # print(y[0].tolist(), break_idx)
-            # print(enc.decode(y[0].tolist()[:break_idx]))
+            # y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k).tolist()
+            y = model.generate_withcache(x.tolist(), max_new_tokens, temperature=temperature, top_k=top_k, eos_id=enc.bos_id, echo=True)
+            print(enc.decode(y[0]))
             print('---------------')
+t1 = time.time()
+print(f'Generation time cost: {t1-t0:.02f}s')

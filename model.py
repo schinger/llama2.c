@@ -2,7 +2,7 @@ import math
 import struct
 import inspect
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -21,7 +21,9 @@ class ModelArgs:
     multiple_of: int = 256  # MLP hidden layer size will be multiple of
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
+    max_batch_size: int = 32 # max batch size for inference (used by cache)
     dropout: float = 0.0
+    cache: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -108,20 +110,36 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
+        self.cache = args.cache
+
+        if args.cache:
+            self.cache_k = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            ))
+            self.cache_v = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            ))
 
         # use flash attention or a manual implementation?
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
-            mask = torch.triu(mask, diagonal=1)
-            self.register_buffer("mask", mask)
 
     def forward(
         self,
         x: torch.Tensor,
+        start_pos: int,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        mask: Optional[torch.Tensor]
     ):
         bsz, seqlen, _ = x.shape
 
@@ -134,6 +152,17 @@ class Attention(nn.Module):
         # RoPE relative positional embeddings
         xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
 
+        # cache the key/values for the next forward pass
+        if self.cache and not self.training:
+            self.cache_k = self.cache_k.to(xq)
+            self.cache_v = self.cache_v.to(xq)
+
+            self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+            self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+            xk = self.cache_k[:bsz, : start_pos + seqlen]
+            xv = self.cache_v[:bsz, : start_pos + seqlen]
+
         # grouped multiquery attention: expand out keys and values
         xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -145,12 +174,11 @@ class Attention(nn.Module):
 
         # flash implementation
         if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
         else:
             # manual implementation
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-            assert hasattr(self, 'mask')
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + mask   # (bs, n_local_heads, seqlen, cache_len + seqlen)
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
@@ -197,8 +225,8 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, freqs_cos, freqs_sin):
-        h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
+    def forward(self, x, start_pos, freqs_cos, freqs_sin, mask):
+        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_cos, freqs_sin, mask)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
@@ -246,15 +274,24 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, start_pos: int = 0) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
-        freqs_cos = self.freqs_cos[:seqlen]
-        freqs_sin = self.freqs_sin[:seqlen]
+        freqs_cos = self.freqs_cos[start_pos : start_pos + seqlen]
+        freqs_sin = self.freqs_sin[start_pos : start_pos + seqlen]
+
+        mask = torch.full(
+                (seqlen, seqlen), float("-inf"), device=tokens.device
+            )
+        mask = torch.triu(mask, diagonal=1)
+        mask = torch.hstack([
+            torch.zeros((seqlen, start_pos), device=tokens.device),
+            mask
+        ]).type_as(h)
 
         for layer in self.layers:
-            h = layer(h, freqs_cos, freqs_sin)
+            h = layer(h, start_pos, freqs_cos, freqs_sin, mask)
         h = self.norm(h)
 
         if targets is not None:
@@ -262,8 +299,7 @@ class Transformer(nn.Module):
             logits = self.output(h)
             self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.output(h)
             self.last_loss = None
 
         return logits
@@ -339,5 +375,94 @@ class Transformer(nn.Module):
                 idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-
         return idx
+    
+    @torch.inference_mode()
+    def generate_withcache(
+        self,
+        prompt_tokens: List[List[int]],
+        max_gen_len: int,
+        temperature: float = 0.6,
+        top_k: int = 0,
+        top_p: float = 0.9,
+        eos_id: int = None,
+        echo: bool = False,
+    ):
+        """
+        Generate text sequences based on provided prompts using the language generation model.
+        """
+        assert self.params.cache, "cache must be enabled for this method"
+        params = self.params
+        bsz = len(prompt_tokens)
+        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+
+        min_prompt_len = min(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)
+        assert max_prompt_len <= params.max_seq_len
+        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
+        assert min_prompt_len < total_len, "prompt is too long, not enough tokens left for generation!"
+
+        pad_id = -1
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long)
+        for k, t in enumerate(prompt_tokens):
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long)
+
+        prev_pos = 0
+        eos_reached = torch.tensor([False] * bsz)
+        input_text_mask = tokens != pad_id
+
+        for cur_pos in range(min_prompt_len, total_len):
+            logits = self(tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
+            if temperature > 0:
+                next_token = sample_top_k_top_p(logits[:, -1], top_k=top_k, top_p=top_p, temperature=temperature)
+            else:
+                next_token = torch.argmax(logits[:, -1], dim=-1)
+
+            next_token = next_token.reshape(-1)
+            # only replace token if prompt has already been generated
+            next_token = torch.where(
+                input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
+            )
+            tokens[:, cur_pos] = next_token
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (
+                next_token == eos_id
+            )
+            prev_pos = cur_pos
+            if all(eos_reached):
+                break
+        out_tokens = []
+        for i, toks in enumerate(tokens.tolist()):
+            # cut to max gen len
+            start = len(prompt_tokens[i])
+            toks = toks[start : start + max_gen_len]
+            # cut to eos tok if any
+            if eos_id in toks:
+                eos_idx = toks.index(eos_id)
+                toks = toks[:eos_idx]
+            if echo:
+                toks = prompt_tokens[i] + toks
+            out_tokens.append(toks)
+        return out_tokens
+
+
+def sample_top_k_top_p(logits, top_k=0, top_p=0.0, temperature=1.0):
+    logits = logits / temperature
+    if top_k > 0:
+        # optionally crop the logits to only the top k options
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < v[:, [-1]]] = -float('Inf')
+        # apply softmax to convert logits to (normalized) probabilities
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+    if 0 <= top_p <= 1.0:
+        # Top-p (nucleus) sampling selects the smallest set of tokens whose cumulative probability mass
+        # exceeds the threshold p. The distribution is renormalized based on the selected tokens.
+        probs = F.softmax(logits, dim=-1)
+        probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
+        mask = probs_sum - probs_sort > top_p
+        probs_sort[mask] = 0.0
+        probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+        next_token = torch.multinomial(probs_sort, num_samples=1)
+        next_token = torch.gather(probs_idx, -1, next_token)
+    return next_token
