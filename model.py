@@ -232,7 +232,6 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    last_loss: Optional[torch.Tensor]
 
     def __init__(self, params: ModelArgs):
         super().__init__()
@@ -262,9 +261,6 @@ class Transformer(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
-
-        # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
-        self.last_loss = None
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -297,12 +293,12 @@ class Transformer(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             logits = self.output(h)
-            self.last_loss = None
+            last_loss = None
 
-        return logits
+        return logits, h, last_loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -358,7 +354,7 @@ class Transformer(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
             # forward the model to get the logits for the index in the sequence
-            logits = self(idx_cond)
+            logits = self(idx_cond)[0]
             logits = logits[:, -1, :] # crop to just the final time step
             if temperature == 0.0:
                 # "sample" the single most likely index
@@ -412,7 +408,7 @@ class Transformer(nn.Module):
         input_text_mask = tokens != pad_id
 
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self(tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
+            logits = self(tokens[:, prev_pos:cur_pos], start_pos=prev_pos)[0]
             if temperature > 0:
                 next_token = sample_top_k_top_p(logits[:, -1], top_k=top_k, top_p=top_p, temperature=temperature)
             else:
@@ -466,3 +462,16 @@ def sample_top_k_top_p(logits, top_k=0, top_p=0.0, temperature=1.0):
         next_token = torch.multinomial(probs_sort, num_samples=1)
         next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
+
+
+class TransformerWithValueHead(Transformer):
+    """ Transformer with an extra head for predicting a scalar value """
+    def __init__(self, params: ModelArgs):
+        super().__init__(params)
+        self.value_head = nn.Linear(params.dim, 1)
+        self._init_weights(self.value_head)
+
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, start_pos: int = 0) -> torch.Tensor:
+        logits, h, last_loss = super().forward(tokens, targets, start_pos)
+        values = self.value_head(h).squeeze(-1)
+        return logits, h, values, last_loss
