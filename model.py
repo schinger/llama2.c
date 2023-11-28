@@ -383,6 +383,7 @@ class Transformer(nn.Module):
         top_p: float = 0.9,
         eos_id: int = None,
         echo: bool = False,
+        device: str = "cpu",
     ):
         """
         Generate text sequences based on provided prompts using the language generation model.
@@ -399,12 +400,12 @@ class Transformer(nn.Module):
         assert min_prompt_len < total_len, "prompt is too long, not enough tokens left for generation!"
 
         pad_id = -1
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long)
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long)
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz)
+        eos_reached = torch.tensor([False] * bsz, device=device)
         input_text_mask = tokens != pad_id
 
         for cur_pos in range(min_prompt_len, total_len):
@@ -434,7 +435,7 @@ class Transformer(nn.Module):
             # cut to eos tok if any
             if eos_id in toks:
                 eos_idx = toks.index(eos_id)
-                toks = toks[:eos_idx]
+                toks = toks[:eos_idx + 1] # keep eos token
             if echo:
                 toks = prompt_tokens[i] + toks
             out_tokens.append(toks)

@@ -66,7 +66,7 @@ def download():
         data = json.load(f)
     print("Download done.")
     print(f"Number of shards: {len(shard_filenames)}")
-    print(f"Example story:\n{json.dumps(data[0:10], indent=2)}")
+    print(f"Example story:\n{json.dumps(data[0:30], indent=2)}")
 
 def train_vocab(vocab_size):
     """

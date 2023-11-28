@@ -2,7 +2,7 @@
 This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
-To run on a single GPU small debug run, example:
+To run on a single GPU/CPU, example:
 $ python -m train.py --compile=False --eval_iters=10 --batch_size=8
 
 To run with DDP on 4 gpus on 1 node, example:
@@ -19,6 +19,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 import math
 import os
 import time
+from copy import deepcopy
 from contextlib import nullcontext
 from datetime import datetime
 from functools import partial
@@ -28,7 +29,8 @@ from model import Transformer, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from tinystories import Task
+from tinystories import Task, get_tokenizer_model_path
+from tokenizer import Tokenizer
 from export import model_export
 
 # -----------------------------------------------------------------------------
@@ -49,6 +51,7 @@ batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch 
 max_seq_len = 256
 vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
 vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
+tokenizer = "" # override the tokenizer model path
 # model
 dim = 288
 n_layers = 6
@@ -57,7 +60,7 @@ n_kv_heads = 6
 multiple_of = 32
 dropout = 0.0
 # adamw optimizer
-gradient_accumulation_steps = 4  # used to simulate larger batch sizes
+gradient_accumulation_steps = 1  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
 max_iters = 100000  # total number of training iterations
 weight_decay = 1e-1
@@ -71,6 +74,9 @@ warmup_iters = 1000  # how many steps to warm up for
 device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
+# PPO
+ppo = False
+max_gen_len = 100
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -153,6 +159,7 @@ model_args = dict(
     multiple_of=multiple_of,
     max_seq_len=max_seq_len,
     dropout=dropout,
+    cache=ppo==True,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -179,10 +186,24 @@ elif init_from == "resume":
     for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-    model.load_state_dict(state_dict, strict=False)
+    _IncompatibleKeys = model.load_state_dict(state_dict, strict=False)
+    print(f"Loaded checkpoint {checkpoint} with result: {_IncompatibleKeys}")
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 model.to(device)
+
+# load the tokenizer
+vocab_source = checkpoint["config"].get("vocab_source", "llama2")
+vocab_size = gptconf.vocab_size
+if tokenizer:
+    # a specific tokenizer is provided, use it
+    tokenizer_model = tokenizer
+else:
+    # let's try to find the tokenizer model automatically. bit gross here...
+    query_vocab_size = 0 if vocab_source == "llama2" else vocab_size
+    tokenizer_model = get_tokenizer_model_path(vocab_size=query_vocab_size)
+enc = Tokenizer(tokenizer_model=tokenizer_model)
+
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
@@ -207,6 +228,26 @@ if ddp:
     model._ddp_params_and_buffers_to_ignore = {prefix + "freqs_cis"}
     model = DDP(model, device_ids=[ddp_local_rank])
 
+# ppo setup
+if ppo:
+    from ppo import PPOTrainer, PPOConfig, LengthSampler, LengthReward
+
+    ppoconf = PPOConfig(
+        seed=0,
+        target_kl=6.0,
+        kl_penalty="kl",
+        learning_rate=learning_rate,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        mini_batch_size=batch_size,
+        backward_batch_size=batch_size*gradient_accumulation_steps,
+        batch_size=batch_size*8, # Number of samples per rollout.
+    )
+    ref_model = deepcopy(model)
+    for p in ref_model.parameters():
+        p.requires_grad = False
+    ppo_trainer = PPOTrainer(ppoconf, model, ref_model.eval(), enc, optimizer, scaler)
+    input_size = LengthSampler(min_value=0, max_value=10)
+    reward_func = LengthReward(50)
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -286,50 +327,81 @@ while True:
                     "config": config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt" if not ppo else "ppo_ckpt.pt"))
                 model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
-        with ctx:
-            logits, _, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = next(train_batch_iter)
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+    if not ppo: # pretraining or finetuning
+        # forward backward update, with optional gradient accumulation to simulate larger batch size
+        # and using the GradScaler if data type is float16
+        for micro_step in range(gradient_accumulation_steps):
+            if ddp:
+                # in DDP training we only need to sync gradients at the last micro step.
+                # the official way to do this is with model.no_sync() context manager, but
+                # I really dislike that this bloats the code and forces us to repeat code
+                # looking at the source of that context manager, it just toggles this variable
+                model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
+            with ctx:
+                logits, _, loss = model(X, Y)
+                loss = loss / gradient_accumulation_steps
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            X, Y = next(train_batch_iter)
+            # backward pass, with gradient scaling if training in fp16
+            scaler.scale(loss).backward()
+        # clip the gradient
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # step the optimizer and scaler if training in fp16
+        scaler.step(optimizer)
+        scaler.update()
+        # flush the gradients as soon as we can, no need for this memory anymore
+        optimizer.zero_grad(set_to_none=True)
+    else: # ppo training
+        query_tokens = []
+        response_tokens = []
+        # prepare prompt (actually is several start tokens)
+        while len(query_tokens) < ppoconf.batch_size:
+            X = X.tolist()
+            for x in X:
+                if enc.bos_id in x:
+                    begin = x.index(enc.bos_id)
+                    end = begin + input_size() + 1
+                    query_tokens.append(x[begin:end])
+            X, _ = next(train_batch_iter)
+        query_tokens = query_tokens[:ppoconf.batch_size]
+        # rollouts
+        for i in range(math.ceil(ppoconf.batch_size / gptconf.max_batch_size)):
+            batch = query_tokens[i*gptconf.max_batch_size:(i+1)*gptconf.max_batch_size] # batch for inference (used by cache)
+            response = model.generate_withcache(batch, max_gen_len, temperature=1.0, top_k=0, top_p=1.0, eos_id=enc.bos_id, echo=False, device=device)
+            response_tokens.extend(response)
+        # compute rewards
+        rewards = [reward_func(len(q+r)) for q,r in zip(query_tokens, response_tokens)]
+        # to tensor and correct device
+        query_tensors = [torch.tensor(q, dtype=torch.long, device=device) for q in query_tokens]
+        response_tensors = [torch.tensor(r, dtype=torch.long, device=device) for r in response_tokens]
+        reward_tensors = [torch.tensor(rw, dtype=torch.float, device=device) for rw in rewards]
+        # ppo step
+        ppo_stat = ppo_trainer.step(query_tensors, response_tensors, reward_tensors)
+
 
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5:  # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-        print(
-            f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt*1000:.2f}ms | mfu {running_mfu*100:.2f}%"
-        )
+        if not ppo:
+            # get loss as float, scale up due to the divide above. note: this is a CPU-GPU sync point
+            lossf = loss.item() * gradient_accumulation_steps
+            print(
+                f"{iter_num} | loss {lossf:.4f} | lr {lr:e} | {dt*1000:.2f}ms"
+            )
+        else:
+            reward_mean = sum(rewards) / len(rewards)
+            print(
+                f"{iter_num} | reward {reward_mean:.4f} | lr {lr:e} | {dt*1000:.2f}ms"
+            )
     iter_num += 1
     local_iter_num += 1
 
