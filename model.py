@@ -139,7 +139,8 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
-        mask: Optional[torch.Tensor]
+        mask: Optional[torch.Tensor],
+        cache: Optional[bool] = False,
     ):
         bsz, seqlen, _ = x.shape
 
@@ -153,7 +154,8 @@ class Attention(nn.Module):
         xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
 
         # cache the key/values for the next forward pass
-        if self.cache and not self.training:
+        if cache and not self.training:
+            assert self.cache, "cache must be enabled"
             self.cache_k = self.cache_k.to(xq)
             self.cache_v = self.cache_v.to(xq)
 
@@ -225,8 +227,8 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x, start_pos, freqs_cos, freqs_sin, mask):
-        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_cos, freqs_sin, mask)
+    def forward(self, x, start_pos, freqs_cos, freqs_sin, mask, cache):
+        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_cos, freqs_sin, mask, cache)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
@@ -270,7 +272,7 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, start_pos: int = 0) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, start_pos: int = 0, cache: bool = False) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
@@ -287,7 +289,7 @@ class Transformer(nn.Module):
         ]).type_as(h)
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cos, freqs_sin, mask)
+            h = layer(h, start_pos, freqs_cos, freqs_sin, mask, cache)
         h = self.norm(h)
 
         if targets is not None:
@@ -409,7 +411,7 @@ class Transformer(nn.Module):
         input_text_mask = tokens != pad_id
 
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self(tokens[:, prev_pos:cur_pos], start_pos=prev_pos)[0]
+            logits = self(tokens[:, prev_pos:cur_pos], start_pos=prev_pos, cache=True)[0]
             if temperature > 0:
                 next_token = sample_top_k_top_p(logits[:, -1], top_k=top_k, top_p=top_p, temperature=temperature)
             else:
@@ -429,9 +431,10 @@ class Transformer(nn.Module):
                 break
         out_tokens = []
         for i, toks in enumerate(tokens.tolist()):
-            # cut to max gen len
             start = len(prompt_tokens[i])
-            toks = toks[start : start + max_gen_len]
+            # cut to max gen len
+            # toks = toks[start : start + max_gen_len]
+            toks = toks[start : ]
             # cut to eos tok if any
             if eos_id in toks:
                 eos_idx = toks.index(eos_id)
@@ -472,7 +475,7 @@ class TransformerWithValueHead(Transformer):
         self.value_head = nn.Linear(params.dim, 1)
         self._init_weights(self.value_head)
 
-    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, start_pos: int = 0) -> torch.Tensor:
-        logits, h, last_loss = super().forward(tokens, targets, start_pos)
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, start_pos: int = 0, cache: bool = False) -> torch.Tensor:
+        logits, h, last_loss = super().forward(tokens, targets, start_pos, cache)
         values = self.value_head(h).squeeze(-1)
         return logits, h, values, last_loss

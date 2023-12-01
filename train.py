@@ -19,13 +19,14 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 import math
 import os
 import time
+import json
 from copy import deepcopy
 from contextlib import nullcontext
 from datetime import datetime
 from functools import partial
 
 import torch
-from model import Transformer, ModelArgs
+from model import Transformer, TransformerWithValueHead, ModelArgs
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -76,7 +77,7 @@ dtype = "bfloat16"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # PPO
 ppo = False
-max_gen_len = 100
+max_gen_len = 300
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -165,7 +166,7 @@ if init_from == "scratch":
     # init a new model from scratch
     print("Initializing a new model from scratch")
     gptconf = ModelArgs(**model_args)
-    model = Transformer(gptconf)
+    model = Transformer(gptconf) if not ppo else TransformerWithValueHead(gptconf)
 elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -178,7 +179,7 @@ elif init_from == "resume":
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = ModelArgs(**model_args)
-    model = Transformer(gptconf)
+    model = Transformer(gptconf) if not ppo else TransformerWithValueHead(gptconf)
     state_dict = checkpoint["model"]
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -187,7 +188,7 @@ elif init_from == "resume":
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
     _IncompatibleKeys = model.load_state_dict(state_dict, strict=False)
-    print(f"Loaded checkpoint {checkpoint} with result: {_IncompatibleKeys}")
+    print(f"Loaded checkpoint {ckpt_path} with result: {_IncompatibleKeys}")
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 model.to(device)
@@ -245,9 +246,9 @@ if ppo:
     ref_model = deepcopy(model)
     for p in ref_model.parameters():
         p.requires_grad = False
-    ppo_trainer = PPOTrainer(ppoconf, model, ref_model.eval(), enc, optimizer, scaler)
+    ppo_trainer = PPOTrainer(ppoconf, model, ref_model.eval(), enc, optimizer, scaler, ddp)
     input_size = LengthSampler(min_value=0, max_value=10)
-    reward_func = LengthReward(50)
+    reward_func = LengthReward(200)
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -259,7 +260,8 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = next(batch_iter)
             with ctx:
-                logits, h, loss = model(X, Y)
+                outputs = model(X, Y)
+                loss = outputs[-1]
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -343,7 +345,8 @@ while True:
                 # looking at the source of that context manager, it just toggles this variable
                 model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
             with ctx:
-                logits, _, loss = model(X, Y)
+                outputs = model(X, Y)
+                loss = outputs[-1]
                 loss = loss / gradient_accumulation_steps
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = next(train_batch_iter)
@@ -372,12 +375,20 @@ while True:
             X, _ = next(train_batch_iter)
         query_tokens = query_tokens[:ppoconf.batch_size]
         # rollouts
+        model.eval()
         for i in range(math.ceil(ppoconf.batch_size / gptconf.max_batch_size)):
             batch = query_tokens[i*gptconf.max_batch_size:(i+1)*gptconf.max_batch_size] # batch for inference (used by cache)
             response = model.generate_withcache(batch, max_gen_len, temperature=1.0, top_k=0, top_p=1.0, eos_id=enc.bos_id, echo=False, device=device)
             response_tokens.extend(response)
+
+        # print("query_tokens", query_tokens)
+        # print("response_tokens", response_tokens)
+        # print("query_tokens length", [len(q) for q in query_tokens])
+        # print("response_tokens length", [len(r) for r in response_tokens])
         # compute rewards
         rewards = [reward_func(len(q+r)) for q,r in zip(query_tokens, response_tokens)]
+        # print("rewards", rewards)
+        print("q+r lengths", [len(q+r) for q,r in zip(query_tokens[:10], response_tokens[:10])])
         # to tensor and correct device
         query_tensors = [torch.tensor(q, dtype=torch.long, device=device) for q in query_tokens]
         response_tensors = [torch.tensor(r, dtype=torch.long, device=device) for r in response_tokens]
@@ -402,6 +413,7 @@ while True:
             print(
                 f"{iter_num} | reward {reward_mean:.4f} | lr {lr:e} | {dt*1000:.2f}ms"
             )
+            # print(json.dumps(ppo_stat, indent=4))
     iter_num += 1
     local_iter_num += 1
 

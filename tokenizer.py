@@ -5,7 +5,8 @@
 import os
 import struct
 import argparse
-from typing import List
+import torch
+from typing import List, Dict
 
 from sentencepiece import SentencePieceProcessor
 
@@ -37,6 +38,21 @@ class Tokenizer:
 
     def decode(self, t: List[int]) -> str:
         return self.sp_model.decode(t)
+    
+    def pad(self, input_data: List[Dict]) -> Dict:
+        """Pad the input data to the max length in the batch, the input data element contains input_ids, attention_mask"""
+        max_len = max([len(x["input_ids"]) for x in input_data])
+        result = {"input_ids": torch.zeros(len(input_data), max_len, dtype=torch.long), "attention_mask": torch.zeros(len(input_data), max_len, dtype=torch.long)}
+        is_tensor_ele = isinstance(input_data[0]["input_ids"], torch.Tensor)
+        for i, data in enumerate(input_data):
+            if not is_tensor_ele:
+                result["input_ids"][i, :len(data["input_ids"])] = torch.tensor(data["input_ids"])
+                result["attention_mask"][i, :len(data["attention_mask"])] = torch.tensor(data["attention_mask"])
+            else:
+                result["input_ids"][i, :len(data["input_ids"])] = data["input_ids"]
+                result["attention_mask"][i, :len(data["attention_mask"])] = data["attention_mask"]
+        return result
+        
 
     def export(self):
 
