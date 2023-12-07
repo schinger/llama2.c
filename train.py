@@ -77,7 +77,10 @@ dtype = "bfloat16"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # PPO
 ppo = False
+ppo_debug = True
+start_len = 1
 max_gen_len = 300
+target_len = 200
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -235,9 +238,11 @@ if ppo:
 
     ppoconf = PPOConfig(
         seed=0,
+        init_kl_coef=0,
         target_kl=6.0,
         kl_penalty="kl",
         learning_rate=learning_rate,
+        max_grad_norm=grad_clip,
         gradient_accumulation_steps=gradient_accumulation_steps,
         mini_batch_size=batch_size,
         backward_batch_size=batch_size*gradient_accumulation_steps,
@@ -247,8 +252,8 @@ if ppo:
     for p in ref_model.parameters():
         p.requires_grad = False
     ppo_trainer = PPOTrainer(ppoconf, model, ref_model.eval(), enc, optimizer, scaler, ddp)
-    input_size = LengthSampler(min_value=0, max_value=10)
-    reward_func = LengthReward(200)
+    input_size = LengthSampler(min_value=0, max_value=start_len)
+    reward_func = LengthReward(target_len)
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -389,6 +394,7 @@ while True:
         rewards = [reward_func(len(q+r)) for q,r in zip(query_tokens, response_tokens)]
         # print("rewards", rewards)
         print("q+r lengths", [len(q+r) for q,r in zip(query_tokens[:10], response_tokens[:10])])
+        print('q+r lengths avg', sum([len(q+r) for q,r in zip(query_tokens, response_tokens)]) / len(query_tokens))
         # to tensor and correct device
         query_tensors = [torch.tensor(q, dtype=torch.long, device=device) for q in query_tokens]
         response_tensors = [torch.tensor(r, dtype=torch.long, device=device) for r in response_tokens]
@@ -413,7 +419,8 @@ while True:
             print(
                 f"{iter_num} | reward {reward_mean:.4f} | lr {lr:e} | {dt*1000:.2f}ms"
             )
-            # print(json.dumps(ppo_stat, indent=4))
+            if ppo_debug:
+                print(json.dumps(ppo_stat, indent=4))
     iter_num += 1
     local_iter_num += 1
 

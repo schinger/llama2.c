@@ -79,6 +79,7 @@ with torch.no_grad():
         for k in range(num_samples):
             # y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k).tolist()
             y = model.generate_withcache(x.tolist(), max_new_tokens, temperature=temperature, top_k=top_k, eos_id=enc.bos_id, echo=True)
+            print('length:', len(y[0]))
             print(enc.decode(y[0]))
             print('---------------')
 t1 = time.time()
