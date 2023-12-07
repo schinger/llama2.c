@@ -241,6 +241,7 @@ if ppo:
         init_kl_coef=0,
         target_kl=6.0,
         kl_penalty="kl",
+        early_stopping=True,
         learning_rate=learning_rate,
         max_grad_norm=grad_clip,
         gradient_accumulation_steps=gradient_accumulation_steps,

@@ -65,12 +65,12 @@ class PPOConfig:
     max_grad_norm: Optional[float] = None
     """Maximum gradient norm for gradient clipping"""
     early_stopping: bool = False
-    """Whether to stop the PPO optimization loop early is the KL too high"""
-    target_kl: float = 1
+    """Whether to stop the PPO optimization loop early if the KL too high"""
+    target_kl: float = 0.1
     """Stop early if we exceed this value by over 50%"""
     compare_steps: int = 1
     """Number of steps between comparison of the current reward with the best seen so far"""
-    ratio_threshold: float = 10.0
+    ratio_threshold: float = 1.5
     """Skip mini-batches with high PPO ratios that can cause loss spikes"""
     whiten_rewards: bool = False
     """Whiten the rewards before compute advantages"""
@@ -192,7 +192,7 @@ class PPOTrainer():
         t = time.time()
         all_stats = []
         early_stop = False
-        for _ in range(self.config.ppo_epochs):
+        for ep in range(self.config.ppo_epochs):
             if early_stop:
                 break
             b_inds = np.random.permutation(bs)
@@ -256,6 +256,7 @@ class PPOTrainer():
                 policykl = train_stats["policy/policykl"]
                 early_stop = self._early_stop(policykl)
                 if early_stop:
+                    print(f"Early stopping at epoch {ep}, policykl is {policykl} larger than {self.config.target_kl*1.5}")
                     break
 
         timing["time/ppo/optimize_step"] = time.time() - t

@@ -47,9 +47,9 @@ This should print the samples. If you leave out the `-z` flag, it will use the d
 ## Just learn the target length
 
 ```
-python train.py     --out_dir="stories260K"     --batch_size=20     --max_seq_len=512     --gradient_accumulation_steps=1     --vocab_source="custom"     --vocab_size=512     --dim=64     --n_layers=5     --n_heads=8     --n_kv_heads=4     --multiple_of=4     --learning_rate=1e-4     --dropout=0.00     --weight_decay=0.01     --max_iters=200000     --beta2=0.99     --warmup_iters=1000     --eval_interval=20     --eval_iters=5     --compile=False    --device=cpu    --eval_only=False   --init_from="resume" --ppo=True  --decay_lr=False  --always_save_checkpoint=True
+python train.py     --out_dir="stories260K"     --batch_size=20     --max_seq_len=512     --gradient_accumulation_steps=1     --vocab_source="custom"     --vocab_size=512     --dim=64     --n_layers=5     --n_heads=8     --n_kv_heads=4     --multiple_of=4     --learning_rate=1e-3     --dropout=0.00     --weight_decay=0.01     --max_iters=200000     --beta2=0.99     --warmup_iters=1000     --eval_interval=20     --eval_iters=5     --compile=False    --device=cpu    --eval_only=False   --init_from="resume" --ppo=True  --decay_lr=False  --always_save_checkpoint=True
 ```
-after run about 120 iterations (98120), it can reach the goal.
+after run about 50 iterations (98050), it can reach the goal.
 ## License
 
 MIT
