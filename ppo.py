@@ -149,6 +149,8 @@ class PPOTrainer():
         model_inputs = {k: v.to(queries[0].device) for k, v in model_inputs.items()}
         model_inputs_names = list(model_inputs.keys())
 
+        full_kl_penalty = self.config.kl_penalty == "full"
+
         self.model.eval()
         with torch.no_grad():
             all_logprobs, logits_or_none, values, masks = self.batched_forward_pass(
@@ -157,12 +159,14 @@ class PPOTrainer():
                 responses,
                 model_inputs,
                 response_masks=response_masks,
+                return_logits=full_kl_penalty,
             )
             ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
                 self.ref_model,
                 queries,
                 responses,
                 model_inputs,
+                return_logits=full_kl_penalty,
             )
             kl_ref = ((all_logprobs - ref_logprobs) * masks).sum(axis=-1).mean()
 
@@ -170,7 +174,15 @@ class PPOTrainer():
 
         with torch.no_grad():
             t = time.time()
-            rewards, non_score_reward = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
+            if full_kl_penalty:
+                active_full_logprobs = logprobs_from_logits(logits_or_none, None, gather=False)
+                ref_full_logprobs = logprobs_from_logits(ref_logits_or_none, None, gather=False)
+
+                rewards, non_score_reward = self.compute_rewards(
+                    scores, active_full_logprobs, ref_full_logprobs, masks
+                )
+            else:
+                rewards, non_score_reward = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
             reward_all = (rewards * masks).sum(axis=-1).mean()
             timing["time/ppo/compute_rewards"] = time.time() - t
 
@@ -401,6 +413,10 @@ class PPOTrainer():
 
         if self.config.kl_penalty == "mse":
             return 0.5 * (logprob - ref_logprob).square()
+        
+        if self.config.kl_penalty == "full":
+            # Flip is required due to this issue? :https://github.com/pytorch/pytorch/issues/57459
+            return F.kl_div(ref_logprob, logprob, log_target=True, reduction="none").sum(-1)
 
         raise NotImplementedError
     
