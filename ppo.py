@@ -164,12 +164,14 @@ class PPOTrainer():
                 responses,
                 model_inputs,
             )
+            kl_ref = ((all_logprobs - ref_logprobs) * masks).sum(axis=-1).mean()
 
         timing["time/ppo/forward_pass"] = time.time() - t
 
         with torch.no_grad():
             t = time.time()
             rewards, non_score_reward = self.compute_rewards(scores, all_logprobs, ref_logprobs, masks)
+            reward_all = (rewards * masks).sum(axis=-1).mean()
             timing["time/ppo/compute_rewards"] = time.time() - t
 
             t = time.time()
@@ -268,6 +270,9 @@ class PPOTrainer():
             stats[f"ppo/{k}"] = float(torch.mean(v, axis=0).detach().cpu().numpy()[0])
         timing["time/ppo/calc_stats"] = time.time() - t
         stats["ppo/learning_rate"] = self.optimizer.param_groups[0]["lr"]
+        # if kl_ref < 0, then we are in trouble. (KL should be positive. (ln(x) <= x - 1))
+        stats["ppo/kl_ref"] = float(kl_ref.item()) # this is actually the penalty term in reward we want to minimize.
+        stats["ppo/reward_all"] = float(reward_all.item()) # this is the actual reward we want to maximize. (reward - kl_ref)
         # Log the total ppo time
         timing["time/ppo/total"] = time.time() - t0
         stats.update(timing)
@@ -483,7 +488,7 @@ class PPOTrainer():
             loss=dict(policy=pg_loss.detach(), value=vf_loss.detach(), total=loss.detach()),
             policy=dict(
                 entropy=entropy.detach(),
-                approxkl=approxkl.detach(),
+                # approxkl=approxkl.detach(),
                 policykl=policykl.detach(),
                 clipfrac=pg_clipfrac.detach(),
                 advantages_mean=masked_mean(advantages, mask).detach(),

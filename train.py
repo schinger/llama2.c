@@ -78,7 +78,7 @@ compile = True  # use PyTorch 2.0 to compile the model to be faster
 # PPO
 ppo = False
 ppo_debug = True
-start_len = 1
+start_len = 30
 max_gen_len = 300
 target_len = 200
 # -----------------------------------------------------------------------------
@@ -238,9 +238,9 @@ if ppo:
 
     ppoconf = PPOConfig(
         seed=0,
-        init_kl_coef=0,
-        target_kl=6.0,
+        init_kl_coef=0.2,
         kl_penalty="kl",
+        target_kl=0.2,
         early_stopping=True,
         learning_rate=learning_rate,
         max_grad_norm=grad_clip,
