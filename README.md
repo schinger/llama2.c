@@ -3,7 +3,7 @@
 [Karpathy/llama2.c](https://github.com/karpathy/llama2.c) is a great project that includes nearly all the parts to build LLMs. The only thing it doesn't include is RLHF. This project is based on llama2.c and add PPO(RLHF) to it. Also, we make README.md more clear and follow the steps to build LLMs from scratch.
 
 ## Custom tokenizers
-Firstly, we use TinyStories dataset throughout the whole project. To download:
+Firstly, we use [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset throughout the whole project. To download:
 ```
 python tinystories.py download
 ```
@@ -19,7 +19,7 @@ You can also leverage the default Llama2 tokenizers (vocab size 32,000, we don't
 python tinystories.py pretokenize
 ```
 ## Pre-training/finetuning
-We pretrain a very small Llama2 model (260K parameters) from scratch:
+We pretrain a very small Llama2 model (260K parameters) from [scratch](https://github.com/karpathy/llama2.c/blob/master/doc/stories260K.md):
 ```
 python train.py \
     --out_dir="outmini" \
@@ -111,7 +111,7 @@ python train.py     \
     --always_save_checkpoint=True  \
     --start_len=30
 ```
-You can see that we are using cpu to do PPO training, it is because we are using a very small model and the training is very efficient!
+You can see that we are using cpu do PPO training, it is because we are using a very small model and the training is very efficient!
 
 Initial statistics:
 ```
@@ -251,7 +251,7 @@ q+r lengths avg 200.175
     "time/ppo/total": 103.83504962921143
 }
 ```
-## Inference and Int8 Quantization
+## C Inference and Int8 Quantization
 See [Karpathy/llama2.c](https://github.com/karpathy/llama2.c) 
 
 ## TODO
