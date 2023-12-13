@@ -685,11 +685,11 @@ class LengthSampler:
 
 class LengthReward:
     """
-    Calculates the reward based on the length of the response
+    Calculates the reward based on the length of the sequence
     """
 
-    def __init__(self, target_length=50):
+    def __init__(self, target_length=200):
         self.target_length = target_length
     
-    def __call__(self, response_length):
-        return -abs(self.target_length - response_length)/100.
+    def __call__(self, sequence_length):
+        return -abs(self.target_length - sequence_length)/100.
