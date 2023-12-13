@@ -78,6 +78,8 @@ compile = True  # use PyTorch 2.0 to compile the model to be faster
 # PPO
 ppo = False
 ppo_debug = True
+init_kl_coef = 0.2
+target_kl = 0.2
 start_len = 30
 max_gen_len = 300
 target_len = 200
@@ -237,10 +239,9 @@ if ppo:
     from ppo import PPOTrainer, PPOConfig, LengthSampler, LengthReward
 
     ppoconf = PPOConfig(
-        seed=0,
-        init_kl_coef=0.2,
+        init_kl_coef=init_kl_coef,
         kl_penalty="kl",
-        target_kl=0.2,
+        target_kl=target_kl,
         early_stopping=True,
         learning_rate=learning_rate,
         max_grad_norm=grad_clip,
@@ -387,10 +388,6 @@ while True:
             response = model.generate_withcache(batch, max_gen_len, temperature=1.0, top_k=0, top_p=1.0, eos_id=enc.bos_id, echo=False, device=device)
             response_tokens.extend(response)
 
-        # print("query_tokens", query_tokens)
-        # print("response_tokens", response_tokens)
-        # print("query_tokens length", [len(q) for q in query_tokens])
-        # print("response_tokens length", [len(r) for r in response_tokens])
         # compute rewards
         rewards = [reward_func(len(q+r)) for q,r in zip(query_tokens, response_tokens)]
         # print("rewards", rewards)

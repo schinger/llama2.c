@@ -101,6 +101,7 @@ class PPOTrainer():
         scaler: Optional[torch.cuda.amp.GradScaler] = None,
         is_ddp: bool = False,
     ):
+        np.random.seed(config.seed)
         self.config = config or PPOConfig()
         self.model = model
         self.ref_model = ref_model
